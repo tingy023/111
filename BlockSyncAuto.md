@@ -1,4 +1,3 @@
-
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
@@ -59,19 +58,27 @@ namespace BlockSyncAuto
             using (DocumentLock docLock = doc.LockDocument())
             using (Transaction tr = doc.Database.TransactionManager.StartTransaction())
             {
-                BlockTableRecord modelSpace = (BlockTableRecord)tr.GetObject(
+                BlockTableRecord ms = tr.GetObject(
                     SymbolUtilityServices.GetBlockModelSpaceId(doc.Database),
-                    OpenMode.ForWrite);
+                    OpenMode.ForWrite) as BlockTableRecord;
 
                 int count = 0;
-                foreach (ObjectId id in modelSpace)
+                List<ObjectId> toDelete = new List<ObjectId>();
+                
+                foreach (ObjectId id in ms)
                 {
-                    Entity ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                    Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
                     if (ent != null && ent.Layer == SyncLayer)
                     {
-                        ent.Erase();
+                        toDelete.Add(id);
                         count++;
                     }
+                }
+
+                foreach (ObjectId id in toDelete)
+                {
+                    Entity ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                    ent.Erase();
                 }
 
                 tr.Commit();
@@ -84,7 +91,6 @@ namespace BlockSyncAuto
             try
             {
                 if (string.IsNullOrEmpty(SourceDocName) || string.IsNullOrEmpty(TargetDocName)) return;
-
                 var activeDoc = Application.DocumentManager.MdiActiveDocument;
                 if (activeDoc == null) return;
 
@@ -111,7 +117,7 @@ namespace BlockSyncAuto
                     Document srcDoc = activeDoc.Name == SourceDocName ? activeDoc : otherDoc;
                     Document dstDoc = activeDoc.Name == SourceDocName ? otherDoc : activeDoc;
 
-                    using (DocumentLock lockSrc = srcDoc.LockDocument())
+                    // 先锁定目标文档
                     using (DocumentLock lockDst = dstDoc.LockDocument())
                     {
                         SyncBlocks(srcDoc, dstDoc, ed);
@@ -131,7 +137,7 @@ namespace BlockSyncAuto
 
         private static void EnsureLayerExists(Database db, Transaction tr, string layerName)
         {
-            LayerTable lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+            LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
             if (!lt.Has(layerName))
             {
                 lt.UpgradeOpen();
@@ -146,105 +152,82 @@ namespace BlockSyncAuto
         {
             try
             {
-                // 读取源文件中的块参照
-                List<BlockData> sourceBlocks = new List<BlockData>();
-                using (Transaction tr = srcDoc.Database.TransactionManager.StartTransaction())
+                // 临时数据库用于中转
+                using (Database tempDb = new Database(true, true))
                 {
-                    BlockTable bt = (BlockTable)tr.GetObject(srcDoc.Database.BlockTableId, OpenMode.ForRead);
-                    BlockTableRecord ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-
-                    foreach (ObjectId id in ms)
+                    // 第一步：收集源文档中的块到临时数据库
+                    ObjectIdCollection sourceIds = new ObjectIdCollection();
+                    using (Transaction tr = srcDoc.Database.TransactionManager.StartTransaction())
                     {
-                        Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
-                        if (ent is BlockReference br && ent.Layer == SyncLayer)
+                        BlockTableRecord ms = tr.GetObject(
+                            SymbolUtilityServices.GetBlockModelSpaceId(srcDoc.Database),
+                            OpenMode.ForRead) as BlockTableRecord;
+
+                        foreach (ObjectId id in ms)
                         {
-                            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
-                            sourceBlocks.Add(new BlockData
+                            Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                            if (ent is BlockReference && ent.Layer == SyncLayer)
                             {
-                                BlockName = btr.Name,
-                                Position = br.Position,
-                                XScale = br.ScaleFactors.X,
-                                YScale = br.ScaleFactors.Y,
-                                ZScale = br.ScaleFactors.Z,
-                                Rotation = br.Rotation
-                            });
-                        }
-                    }
-                    tr.Commit();
-                }
-
-                if (sourceBlocks.Count == 0)
-                {
-                    ed.WriteMessage($"\n源文件中没有需要同步的块。");
-                    return;
-                }
-
-                // 在目标文件中同步
-                using (Transaction tr = dstDoc.Database.TransactionManager.StartTransaction())
-                {
-                    // 确保图层存在
-                    EnsureLayerExists(dstDoc.Database, tr, SyncLayer);
-
-                    // 获取目标文件的模型空间
-                    BlockTable bt = (BlockTable)tr.GetObject(dstDoc.Database.BlockTableId, OpenMode.ForRead);
-                    BlockTableRecord ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
-
-                    // 删除目标文件中的现有块
-                    List<ObjectId> toDelete = new List<ObjectId>();
-                    foreach (ObjectId id in ms)
-                    {
-                        Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
-                        if (ent != null && ent.Layer == SyncLayer)
-                        {
-                            toDelete.Add(id);
-                        }
-                    }
-
-                    foreach (ObjectId id in toDelete)
-                    {
-                        Entity ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
-                        ent.Erase();
-                    }
-
-                    // 导入块定义并创建新的块参照
-                    foreach (var blockData in sourceBlocks)
-                    {
-                        if (!bt.Has(blockData.BlockName))
-                        {
-                            // 从源文件获取块定义
-                            ObjectId srcBlockId;
-                            using (Transaction trSrc = srcDoc.Database.TransactionManager.StartTransaction())
-                            {
-                                BlockTable btSrc = (BlockTable)trSrc.GetObject(srcDoc.Database.BlockTableId, OpenMode.ForRead);
-                                srcBlockId = btSrc[blockData.BlockName];
-                                trSrc.Commit();
+                                sourceIds.Add(id);
                             }
-
-                            // 克隆块定义到目标文件
-                            ObjectIdCollection ids = new ObjectIdCollection();
-                            ids.Add(srcBlockId);
-                            IdMapping mapping = new IdMapping();
-                            srcDoc.Database.WblockCloneObjects(ids, dstDoc.Database.BlockTableId, mapping, DuplicateRecordCloning.Replace, false);
                         }
-
-                        // 创建新的块参照
-                        BlockReference newBr = new BlockReference(blockData.Position, bt[blockData.BlockName]);
-                        newBr.Layer = SyncLayer;
-                        newBr.ScaleFactors = new Scale3d(blockData.XScale, blockData.YScale, blockData.ZScale);
-                        newBr.Rotation = blockData.Rotation;
-                        ms.AppendEntity(newBr);
-                        tr.AddNewlyCreatedDBObject(newBr, true);
+                        tr.Commit();
                     }
 
-                    tr.Commit();
-                    ed.WriteMessage($"\n成功同步 {sourceBlocks.Count} 个块参照。");
+                    if (sourceIds.Count == 0)
+                    {
+                        ed.WriteMessage($"\n源文件中没有需要同步的块。");
+                        return;
+                    }
+
+                    // 第二步：清理目标文档中的旧块
+                    using (Transaction tr = dstDoc.Database.TransactionManager.StartTransaction())
+                    {
+                        EnsureLayerExists(dstDoc.Database, tr, SyncLayer);
+
+                        BlockTableRecord ms = tr.GetObject(
+                            SymbolUtilityServices.GetBlockModelSpaceId(dstDoc.Database),
+                            OpenMode.ForWrite) as BlockTableRecord;
+
+                        List<ObjectId> toDelete = new List<ObjectId>();
+                        foreach (ObjectId id in ms)
+                        {
+                            Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                            if (ent != null && ent.Layer == SyncLayer)
+                            {
+                                toDelete.Add(id);
+                            }
+                        }
+
+                        foreach (ObjectId id in toDelete)
+                        {
+                            Entity ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                            ent.Erase();
+                        }
+
+                        tr.Commit();
+                    }
+
+                    // 第三步：通过临时数据库克隆块到目标文档
+                    using (Transaction tr = dstDoc.Database.TransactionManager.StartTransaction())
+                    {
+                        BlockTableRecord ms = tr.GetObject(
+                            SymbolUtilityServices.GetBlockModelSpaceId(dstDoc.Database),
+                            OpenMode.ForWrite) as BlockTableRecord;
+
+                        // 使用临时映射确保所有依赖项都被正确克隆
+                        IdMapping mapping = new IdMapping();
+                        srcDoc.Database.WblockCloneObjects(sourceIds, ms.ObjectId, mapping, DuplicateRecordCloning.Replace, false);
+
+                        tr.Commit();
+                        ed.WriteMessage($"\n成功同步 {sourceIds.Count} 个块。");
+                    }
                 }
             }
             catch (System.Exception ex)
             {
                 ed.WriteMessage($"\n同步出错: {ex.Message}");
                 ed.WriteMessage($"\n错误详情: {ex.StackTrace}");
-                throw;
             }
         }
     }
